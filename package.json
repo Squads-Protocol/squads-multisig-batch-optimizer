@@ -1,0 +1,20 @@
+{
+  "name": "squads-multisig-batch-optimizer",
+  "version": "1.0.0",
+  "description": "",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "build:watch": "tsc --watch",
+    "clean": "rm -rf dist",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "private": true,
+  "dependencies": {
+    "@solana/web3.js": "^1.98.4",
+    "@sqds/multisig": "^2.1.4",
+    "typescript": "^5.9.3"
+  }
+}
