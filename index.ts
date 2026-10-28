@@ -46,17 +46,23 @@ const tryAddBucket = (
   message: TransactionMessage,
   bucket: TransactionInstruction[],
   addressLookupTableAccounts: AddressLookupTableAccount[]
-): boolean => {
-  const originalInstructions = [...message.instructions];
-  message.instructions = [...message.instructions, ...bucket];
+): TransactionMessage | null => {
+  // MBO-1 Fix: Build a new message instead of mutating the caller's message. Mutating
+  // shared TransactionMessage instances makes the result depend on call order
+  // and can leave a partially updated message behind when the size check fails.
+  const candidate = new TransactionMessage({
+    payerKey: message.payerKey,
+    recentBlockhash: message.recentBlockhash,
+    instructions: [...message.instructions, ...bucket],
+  });
+
   if (
-    calculateSerializedTxSize(addressLookupTableAccounts, message) >
+    calculateSerializedTxSize(addressLookupTableAccounts, candidate) >
     BATCH_ADD_MAX_SIZE_CHECK
   ) {
-    message.instructions = originalInstructions; // Revert if exceeds limit
-    return false;
+    return null;
   }
-  return true;
+  return candidate;
 };
 
 export interface PackagedBatchedInstructionsResult {
@@ -72,6 +78,14 @@ export const packageInstructions = (
   instructionsBuckets: TransactionInstruction[][],
   addressLookupTableAccounts: AddressLookupTableAccount[]
 ): PackagedBatchedInstructionsResult => {
+  // MBO-3 Fix: Explicit input validation
+  if (!Array.isArray(instructionsBuckets)) {
+    throw new Error("instructionsBuckets must be an array of instruction arrays");
+  }
+  if (!Array.isArray(addressLookupTableAccounts)) {
+    throw new Error("addressLookupTableAccounts must be an array");
+  }
+
   const transactionMessages: TransactionMessage[] = [];
   const failedBuckets: number[] = [];
   const bucketTxMessageIndexes: Array<number> = [];
@@ -84,6 +98,11 @@ export const packageInstructions = (
   });
 
   instructionsBuckets.forEach((bucket, index) => {
+    // MBO-3 Fix: Explicitly check bucket arrays
+    if (!Array.isArray(bucket)) {
+      throw new Error(`Instruction bucket at index ${index} must be an array`);
+    }
+
     // if bucket does not have any instructions, skip it
     if (bucket.length === 0) {
       failedBuckets.push(index);
@@ -91,31 +110,46 @@ export const packageInstructions = (
       return;
     }
 
-    if (!tryAddBucket(currentMessage, bucket, addressLookupTableAccounts)) {
-      // Attempt to add the current bucket to the message failed due to size constraints
-      if (currentMessage.instructions.length > 0) {
-        transactionMessages.push(currentMessage); // Save the message if it has any instructions
-      }
+    const withBucket = tryAddBucket(
+      currentMessage,
+      bucket,
+      addressLookupTableAccounts
+    );
 
-      // Create a new message for the next attempt
-      currentMessage = new TransactionMessage({
-        payerKey: PublicKey.default,
-        recentBlockhash: PublicKey.default.toBase58(),
-        instructions: [],
-      });
-
-      // Try adding the bucket to the new message to see if it fits
-      if (!tryAddBucket(currentMessage, bucket, addressLookupTableAccounts)) {
-        // If the bucket alone exceeds the max size, mark it as failed
-        failedBuckets.push(index);
-        bucketTxMessageIndexes.push(-1);
-      } else {
-        // If the bucket is successfully added, record its message index
-        bucketTxMessageIndexes.push(transactionMessages.length);
-      }
-    } else {
-      // The bucket was added successfully to the current message
+    if (withBucket) {
+      // The bucket was added successfully to the current message.
+      currentMessage = withBucket;
       bucketTxMessageIndexes.push(transactionMessages.length);
+      return;
+    }
+
+    // Attempt to add the current bucket to the message failed due to size constraints.
+    if (currentMessage.instructions.length > 0) {
+      transactionMessages.push(currentMessage); // Save the message if it has any instructions
+    }
+
+    // Create a new message for the next attempt
+    currentMessage = new TransactionMessage({
+      payerKey: PublicKey.default,
+      recentBlockhash: PublicKey.default.toBase58(),
+      instructions: [],
+    });
+
+    // Try adding the bucket to the new message to see if it fits
+    const inEmptyMessage = tryAddBucket(
+      currentMessage,
+      bucket,
+      addressLookupTableAccounts
+    );
+
+    if (inEmptyMessage) {
+      currentMessage = inEmptyMessage;
+      // If the bucket is successfully added, record its message index
+      bucketTxMessageIndexes.push(transactionMessages.length);
+    } else {
+      // If the bucket alone exceeds the max size, mark it as failed
+      failedBuckets.push(index);
+      bucketTxMessageIndexes.push(-1);
     }
   });
 
@@ -156,9 +190,23 @@ export function createBatchAddSingleTransaction({
   };
   fees?: number;
 }): VersionedTransaction {
+  // MBO-3 Fix: Explicit input validations added for strings, integers and ranges
+  if (!blockhash) {
+    throw new Error("blockhash is required");
+  }
+  if (!Number.isInteger(vaultIndex) || vaultIndex < 0 || vaultIndex > 255) {
+    throw new Error("vaultIndex must be an integer between 0 and 255");
+  }
+  if (!Number.isInteger(ephemeralSigners) || ephemeralSigners < 0) {
+    throw new Error("ephemeralSigners must be a non-negative integer");
+  }
+  if (fees !== undefined && (!Number.isFinite(fees) || fees < 0)) {
+    throw new Error("fees must be a non-negative finite number");
+  }
+
   const batchIx = multisig.instructions.batchAddTransaction({
     vaultIndex,
-    multisigPda: new PublicKey(squadAddress),
+    multisigPda: squadAddress, // MBO-3 Fix: Use squadAddress directly as it is already a PublicKey
     member: proposer,
     rentPayer,
     batchIndex,
@@ -175,7 +223,8 @@ export function createBatchAddSingleTransaction({
       recentBlockhash: blockhash,
       instructions: [
         ComputeBudgetProgram.setComputeUnitPrice({
-          microLamports: fees || PRIORITY_FEES,
+          // MBO-2 Fix: Use `??` so that an explicit fee of 0 is intentionally preserved.
+          microLamports: fees ?? PRIORITY_FEES,
         }),
         ComputeBudgetProgram.setComputeUnitLimit({
           units: 100_000,
